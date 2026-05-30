@@ -1,4 +1,4 @@
-# GPT Image Workbench
+# GPT Image WebStudio
 
 一个面向 GPT Image / OpenAI Images 兼容接口的本地图像生成工作台。它把提示词创作、批量出图、随机创意、多轮视觉迭代和图片提示词反推整合在一个 Gradio 界面里，适合需要更细粒度控制图片数量、比例、分辨率和并发流程的用户。
 
@@ -64,7 +64,7 @@ Code -> Download ZIP
 下载完成后，右键解压到一个你容易找到的位置，例如：
 
 ```text
-D:\gpt-image2
+D:\gpt-image-webstudio
 ```
 
 ### 第 2 步：安装 Python
