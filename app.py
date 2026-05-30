@@ -2387,12 +2387,12 @@ js = """
 }
 """
 
-with gr.Blocks(title="GPT Image2 多功能抽卡器", analytics_enabled=False) as app:
+with gr.Blocks(title="GPT Image WebStudio", analytics_enabled=False) as app:
     with gr.Column(elem_classes=["app-shell"]):
         gr.HTML(
             """
             <section class="hero">
-                <h1>GPT Image2 多功能抽卡器</h1>
+                <h1>GPT Image WebStudio</h1>
                 <p>面向批量创作的本地工作台：手动提示词、随机抽卡、创意批量、自我迭代与统一接口设置集中管理。</p>
             </section>
             """
