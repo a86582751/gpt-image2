@@ -23,8 +23,10 @@ QUALITY_PRESETS = ["auto", "medium", "high", "low"]
 MODEL_PROTOCOL_PRESETS = ["自动识别", "OpenAI Chat", "OpenAI Responses", "Gemini 原生", "Claude Messages"]
 ITERATION_PROMPT_SOURCE_PRESETS = ["随机提示词", "自定义提示词"]
 REASONING_EFFORT_PRESETS = ["关闭", "低", "中", "高", "最高"]
+INPUT_FIDELITY_PRESETS = ["low", "high"]
 STOP_FLAGS = {
     "manual": False,
+    "edit": False,
     "random": False,
     "creative": False,
     "iterative": False,
@@ -109,12 +111,14 @@ DEFAULT_CONFIG = {
     "creative_count": 5,
     "retry_count": 1,
     "retry_delay": 2,
+    "image_request_delay": 0,
     "aspect_ratio": "4:3 横图",
     "resolution": "高清",
     "base_url": BASE_URL,
     "model_id": MODEL_ID,
     "quality": "auto",
     "api_key": API_KEY,
+    "edit_input_fidelity": "high",
     "random_base_url": RANDOM_BASE_URL,
     "random_model_id": RANDOM_MODEL_ID,
     "random_api_key": RANDOM_API_KEY,
@@ -143,6 +147,8 @@ def normalize_config(config):
         config["resolution"] = DEFAULT_CONFIG["resolution"]
     if config["quality"] not in QUALITY_PRESETS:
         config["quality"] = DEFAULT_CONFIG["quality"]
+    if config["edit_input_fidelity"] not in INPUT_FIDELITY_PRESETS:
+        config["edit_input_fidelity"] = DEFAULT_CONFIG["edit_input_fidelity"]
     if config["random_protocol"] not in MODEL_PROTOCOL_PRESETS:
         config["random_protocol"] = DEFAULT_CONFIG["random_protocol"]
     if config["iteration_protocol"] not in MODEL_PROTOCOL_PRESETS:
@@ -164,6 +170,9 @@ VISION_READ_TIMEOUT = 600
 IMAGE_READ_TIMEOUT = 1200
 VISION_IMAGE_MAX_SIDE = 1536
 VISION_IMAGE_JPEG_QUALITY = 90
+EDIT_INPUT_COMPRESS_THRESHOLD = int(2.5 * 1024 * 1024)
+EDIT_INPUT_MAX_SIDE = 2048
+EDIT_INPUT_JPEG_QUALITY = 92
 
 
 def persist_config(updates):
@@ -202,7 +211,7 @@ def update_iteration_source_ui(source):
     source = normalize_iteration_prompt_source(source)
     is_custom = source == "自定义提示词"
     preference_label = "创作主题" if is_custom else "初始创作方向"
-    preference_placeholder = "例如：雨后街角、玻璃花房、黄昏海岸" if is_custom else "例如：雨后街角、玻璃花房、黄昏海岸"
+    preference_placeholder = "例如：课堂午睡、雨夜车站、便利店夜班" if is_custom else "例如：白色丝袜、雨夜车站、图书馆"
     custom_prompt_label = "初始提示词（点击输入你需要的提示词）" if is_custom else "初始提示词（由文本模型随机生成）"
     return (
         gr.update(label=preference_label, placeholder=preference_placeholder),
@@ -212,6 +221,10 @@ def update_iteration_source_ui(source):
 
 def normalize_retry_settings(retry_count, retry_delay):
     return max(0, int(retry_count)), max(0, float(retry_delay))
+
+
+def normalize_image_request_delay(image_request_delay):
+    return max(0, min(30, float(image_request_delay or 0)))
 
 
 def request_timeout(read_timeout):
@@ -327,6 +340,26 @@ def resolve_api_url(base_url):
     if base_url.endswith("/v1"):
         return f"{base_url}/images/generations"
     return f"{base_url}/v1/images/generations"
+
+
+def resolve_edit_api_url(base_url):
+    base_url = (base_url or "").strip().rstrip("/")
+    if not base_url:
+        raise ValueError("请填写 API 地址。")
+    if not base_url.startswith(("http://", "https://")):
+        base_url = f"https://{base_url}"
+
+    parsed_url = urlparse(base_url)
+    if not parsed_url.scheme or not parsed_url.netloc:
+        raise ValueError("API 地址格式不正确，请填写类似 https://example.com 的地址。")
+
+    if base_url.endswith("/images/edits"):
+        return base_url
+    if base_url.endswith("/images/generations"):
+        return base_url[: -len("/images/generations")] + "/images/edits"
+    if base_url.endswith("/v1"):
+        return f"{base_url}/images/edits"
+    return f"{base_url}/v1/images/edits"
 
 
 def normalize_base_url(base_url, empty_message, invalid_message):
@@ -747,6 +780,56 @@ def prepare_vision_image(image_path):
         "original_size": original_size,
         "compressed_size": len(data),
         "dimensions": f"{image.width}x{image.height}",
+    }
+
+
+def prepare_edit_input_image(image_path):
+    original_size = os.path.getsize(image_path)
+    suffix = os.path.splitext(image_path)[1].lower()
+    if original_size <= EDIT_INPUT_COMPRESS_THRESHOLD and suffix in (".png", ".jpg", ".jpeg", ".webp"):
+        with open(image_path, "rb") as image_file:
+            data = image_file.read()
+        mime_type = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+        }[suffix]
+        return {
+            "filename": os.path.basename(image_path),
+            "bytes": data,
+            "mime_type": mime_type,
+            "original_size": original_size,
+            "compressed_size": len(data),
+            "dimensions": get_image_dimensions(image_path) or "",
+            "compressed": False,
+        }
+
+    with Image.open(image_path) as image:
+        image = image.convert("RGBA")
+        if max(image.size) > EDIT_INPUT_MAX_SIDE:
+            image.thumbnail((EDIT_INPUT_MAX_SIDE, EDIT_INPUT_MAX_SIDE), Image.Resampling.LANCZOS)
+        background = Image.new("RGB", image.size, (255, 255, 255))
+        background.paste(image, mask=image.getchannel("A"))
+        buffer = BytesIO()
+        background.save(
+            buffer,
+            format="JPEG",
+            quality=EDIT_INPUT_JPEG_QUALITY,
+            optimize=True,
+            progressive=True,
+        )
+        dimensions = f"{background.width}x{background.height}"
+
+    data = buffer.getvalue()
+    return {
+        "filename": f"{os.path.splitext(os.path.basename(image_path))[0]}_compressed.jpg",
+        "bytes": data,
+        "mime_type": "image/jpeg",
+        "original_size": original_size,
+        "compressed_size": len(data),
+        "dimensions": dimensions,
+        "compressed": True,
     }
 
 
@@ -1342,6 +1425,62 @@ def generate_one_image(
     return saved_paths[0]
 
 
+def generate_one_image_edit(
+    prompt,
+    input_images,
+    save_dir,
+    aspect_ratio,
+    resolution,
+    base_url,
+    model_id,
+    quality,
+    api_key,
+    input_fidelity,
+    timestamp,
+    retry_count=1,
+    retry_delay=2,
+    on_retry=None,
+):
+    size = resolve_size(aspect_ratio, resolution)
+    quality = normalize_quality(quality)
+    input_fidelity = input_fidelity if input_fidelity in INPUT_FIDELITY_PRESETS else "high"
+    prepared_images = [prepare_edit_input_image(path) for path in input_images]
+    saved_paths = []
+
+    def request_edit():
+        files = []
+        for image in prepared_images:
+            files.append(("image[]", (image["filename"], BytesIO(image["bytes"]), image["mime_type"])))
+        data = {
+            "model": model_id.strip(),
+            "prompt": prompt.strip(),
+            "size": size,
+            "n": "1",
+            "quality": quality,
+            "input_fidelity": input_fidelity,
+        }
+        response = requests.post(
+            resolve_edit_api_url(base_url),
+            headers={"Authorization": f"Bearer {api_key.strip()}"},
+            data=data,
+            files=files,
+            timeout=request_timeout(IMAGE_READ_TIMEOUT),
+        )
+        return parse_image_items(response)
+
+    image_items = run_with_retry(
+        request_edit,
+        "图片编辑",
+        retries=int(retry_count),
+        delay_seconds=float(retry_delay),
+        on_retry=on_retry,
+    )
+    save_images_from_items(image_items, saved_paths, save_dir, timestamp, retry_count, retry_delay, on_retry)
+    if not saved_paths:
+        raise RuntimeError("接口返回成功，但没有收到图片数据。")
+    return saved_paths[0], prepared_images
+
+
 def format_duration(seconds):
     if seconds < 60:
         return f"{seconds:.1f} 秒"
@@ -1358,7 +1497,7 @@ def run_with_retry(action, label, retries=1, delay_seconds=2, on_retry=None):
             return action()
         except Exception as error:
             last_error = error
-            if label == "图片生成" and is_remote_disconnected_error(error):
+            if label in ("图片生成", "图片编辑") and is_remote_disconnected_error(error):
                 raise RuntimeError(
                     f"{label}遇到 RemoteDisconnected，不再自动重试，避免 API 可能已生成并计费后重复请求：{error}"
                 ) from error
@@ -1381,6 +1520,7 @@ def generate_images_concurrently(
     concurrency,
     retry_count=1,
     retry_delay=2,
+    image_request_delay=0,
     stop_mode=None,
 ):
     save_dir = get_save_dir(save_dir)
@@ -1396,6 +1536,7 @@ def generate_images_concurrently(
     total_started_at = time.perf_counter()
     request_size = resolve_size(aspect_ratio, resolution)
     quality = normalize_quality(quality)
+    image_request_delay = normalize_image_request_delay(image_request_delay)
 
     if not prompt_jobs:
         yield [], "没有可生成的提示词。"
@@ -1403,13 +1544,17 @@ def generate_images_concurrently(
 
     yield (
         build_gallery_items(saved_paths),
-        f"开始生成 {total_count} 张；最大并发 {concurrency}；请求尺寸 {request_size}；品质 {quality}",
+        f"开始生成 {total_count} 张；最大并发 {concurrency}；生图并发间隔 {image_request_delay:g} 秒；请求尺寸 {request_size}；品质 {quality}",
     )
 
     def worker(job):
         job_index, job_prompt = job
         if stop_mode and should_stop(stop_mode):
             raise RuntimeError("任务已停止。")
+        if image_request_delay > 0:
+            time.sleep((job_index - 1) * image_request_delay)
+            if stop_mode and should_stop(stop_mode):
+                raise RuntimeError("任务已停止。")
         started_at = time.perf_counter()
         events = []
         image_path = generate_one_image(
@@ -1493,6 +1638,156 @@ def generate_images_concurrently(
     )
 
 
+def normalize_uploaded_file_paths(uploaded_files):
+    if not uploaded_files:
+        return []
+    if isinstance(uploaded_files, str):
+        return [uploaded_files]
+    paths = []
+    for item in uploaded_files:
+        if isinstance(item, str):
+            paths.append(item)
+        elif hasattr(item, "name"):
+            paths.append(item.name)
+    return paths
+
+
+def format_edit_input_summary(prepared_images):
+    parts = []
+    for index, image in enumerate(prepared_images, start=1):
+        marker = "压缩" if image["compressed"] else "原图"
+        size_text = f"{format_bytes(image['original_size'])} -> {format_bytes(image['compressed_size'])}" if image["compressed"] else format_bytes(image["original_size"])
+        dimensions = f"，{image['dimensions']}" if image["dimensions"] else ""
+        parts.append(f"参考图 {index}：{marker}，{size_text}{dimensions}")
+    return "；".join(parts)
+
+
+def generate_image_edits_concurrently(
+    prompt,
+    input_images,
+    save_dir,
+    image_count,
+    aspect_ratio,
+    resolution,
+    base_url,
+    model_id,
+    quality,
+    api_key,
+    input_fidelity,
+    concurrency,
+    retry_count=1,
+    retry_delay=2,
+    image_request_delay=0,
+):
+    save_dir = get_save_dir(save_dir)
+    os.makedirs(save_dir, exist_ok=True)
+    image_count = int(image_count)
+    concurrency = max(1, min(int(concurrency), image_count or 1))
+    saved_paths = []
+    image_records = []
+    failed_jobs = []
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    total_started_at = time.perf_counter()
+    request_size = resolve_size(aspect_ratio, resolution)
+    quality = normalize_quality(quality)
+    image_request_delay = normalize_image_request_delay(image_request_delay)
+    try:
+        prepared_preview = [prepare_edit_input_image(path) for path in input_images]
+    except Exception as e:
+        yield build_gallery_items(saved_paths), f"参考图读取或压缩失败：{e}"
+        return
+
+    yield (
+        build_gallery_items(saved_paths),
+        f"开始图片编辑 {image_count} 张；最大并发 {concurrency}；生图并发间隔 {image_request_delay:g} 秒；请求尺寸 {request_size}；品质 {quality}；输入保真度 {input_fidelity}；{format_edit_input_summary(prepared_preview)}",
+    )
+
+    def worker(job_index):
+        if should_stop("edit"):
+            raise RuntimeError("任务已停止。")
+        if image_request_delay > 0:
+            time.sleep((job_index - 1) * image_request_delay)
+            if should_stop("edit"):
+                raise RuntimeError("任务已停止。")
+        started_at = time.perf_counter()
+        events = []
+        image_path, prepared_images = generate_one_image_edit(
+            prompt,
+            input_images,
+            save_dir,
+            aspect_ratio,
+            resolution,
+            base_url,
+            model_id,
+            quality,
+            api_key,
+            input_fidelity,
+            f"{timestamp}_edit{job_index:02d}",
+            retry_count,
+            retry_delay,
+            lambda label, attempt, retries, error: events.append(
+                f"第 {job_index} 张{label}触发重试 {attempt}/{retries}：{error}"
+            ),
+        )
+        return job_index, image_path, time.perf_counter() - started_at, events, prepared_images
+
+    try:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            pending_jobs = iter(range(1, image_count + 1))
+            future_to_index = {}
+
+            def submit_next():
+                try:
+                    job_index = next(pending_jobs)
+                except StopIteration:
+                    return False
+                if should_stop("edit"):
+                    return False
+                future_to_index[executor.submit(worker, job_index)] = job_index
+                return True
+
+            for _ in range(concurrency):
+                if not submit_next():
+                    break
+
+            while future_to_index:
+                if should_stop("edit"):
+                    for pending_future in future_to_index:
+                        pending_future.cancel()
+                    yield build_gallery_items(saved_paths), f"已停止：已保存 {len(saved_paths)}/{image_count} 张。"
+                    return
+
+                done, _pending = wait(set(future_to_index), return_when=FIRST_COMPLETED)
+                for future in done:
+                    job_index = future_to_index.pop(future)
+                    try:
+                        index, image_path, elapsed, events, prepared_images = future.result()
+                        saved_paths.append(image_path)
+                        image_records.append((index, image_path, elapsed))
+                        dimensions = get_image_dimensions(image_path) or request_size
+                        status_extra = f"\n{events[-1]}" if events else ""
+                        yield (
+                            build_gallery_items(saved_paths),
+                            f"已完成 {len(saved_paths)}/{image_count} 张；刚完成第 {index} 张，分辨率 {dimensions}，耗时 {format_duration(elapsed)}；{format_edit_input_summary(prepared_images)}；累计耗时 {format_duration(time.perf_counter() - total_started_at)}{status_extra}",
+                        )
+                    except Exception as e:
+                        failed_jobs.append((job_index, str(e)))
+                        yield (
+                            build_gallery_items(saved_paths),
+                            f"第 {job_index} 张图片编辑失败并已跳过：{e}；已保存 {len(saved_paths)}/{image_count} 张，失败 {len(failed_jobs)} 张。",
+                        )
+                    submit_next()
+
+    except Exception as e:
+        yield build_gallery_items(saved_paths), f"图片编辑调度中断：{e}；已保存 {len(saved_paths)}/{image_count} 张。"
+        return
+
+    yield (
+        build_gallery_items(saved_paths),
+        f"图片编辑完成：共保存 {len(saved_paths)} 张；失败 {len(failed_jobs)} 张；{format_generation_stats(image_records, image_count, time.perf_counter() - total_started_at, request_size)}；品质 {quality}；输入保真度 {input_fidelity}；目录 {save_dir}{format_failed_jobs_summary(failed_jobs)}",
+    )
+
+
 def generate_images_from_prompt(
     prompt,
     save_dir,
@@ -1506,6 +1801,7 @@ def generate_images_from_prompt(
     concurrency=1,
     retry_count=1,
     retry_delay=2,
+    image_request_delay=0,
     stop_mode=None,
 ):
     prompt_jobs = [(index, prompt) for index in range(1, int(image_count) + 1)]
@@ -1521,11 +1817,12 @@ def generate_images_from_prompt(
         concurrency,
         retry_count,
         retry_delay,
+        image_request_delay,
         stop_mode,
     )
 
 
-def generate_image(prompt, save_dir, image_count, concurrency, retry_count, retry_delay, aspect_ratio, resolution, base_url, model_id, quality, api_key):
+def generate_image(prompt, save_dir, image_count, concurrency, retry_count, retry_delay, image_request_delay, aspect_ratio, resolution, base_url, model_id, quality, api_key):
     reset_stop_flag("manual")
     if not prompt or not prompt.strip():
         yield [], "请先输入提示词。"
@@ -1538,6 +1835,7 @@ def generate_image(prompt, save_dir, image_count, concurrency, retry_count, retr
         return
 
     retry_count, retry_delay = normalize_retry_settings(retry_count, retry_delay)
+    image_request_delay = normalize_image_request_delay(image_request_delay)
     quality = normalize_quality(quality)
 
     persist_config(
@@ -1548,6 +1846,7 @@ def generate_image(prompt, save_dir, image_count, concurrency, retry_count, retr
             "concurrency": int(concurrency),
             "retry_count": int(retry_count),
             "retry_delay": float(retry_delay),
+            "image_request_delay": image_request_delay,
             "aspect_ratio": aspect_ratio,
             "resolution": resolution,
             "base_url": base_url,
@@ -1570,7 +1869,86 @@ def generate_image(prompt, save_dir, image_count, concurrency, retry_count, retr
         concurrency,
         retry_count,
         retry_delay,
+        image_request_delay,
         "manual",
+    )
+
+
+def generate_image_edit(
+    uploaded_files,
+    prompt,
+    save_dir,
+    image_count,
+    concurrency,
+    retry_count,
+    retry_delay,
+    image_request_delay,
+    aspect_ratio,
+    resolution,
+    base_url,
+    model_id,
+    quality,
+    api_key,
+    input_fidelity,
+):
+    reset_stop_flag("edit")
+    input_images = normalize_uploaded_file_paths(uploaded_files)
+    if not input_images:
+        yield [], "请先上传至少一张参考图。"
+        return
+    if len(input_images) > 4:
+        yield [], "当前先支持最多 4 张参考图，请减少后再试。"
+        return
+    if not prompt or not prompt.strip():
+        yield [], "请先输入编辑提示词。"
+        return
+    if not api_key or not api_key.strip():
+        yield [], "请填写 API Key。"
+        return
+    if not model_id or not model_id.strip():
+        yield [], "请填写模型 ID。"
+        return
+
+    retry_count, retry_delay = normalize_retry_settings(retry_count, retry_delay)
+    image_request_delay = normalize_image_request_delay(image_request_delay)
+    quality = normalize_quality(quality)
+    input_fidelity = input_fidelity if input_fidelity in INPUT_FIDELITY_PRESETS else "high"
+
+    persist_config(
+        {
+            "prompt": prompt,
+            "save_dir": save_dir,
+            "image_count": int(image_count),
+            "concurrency": int(concurrency),
+            "retry_count": int(retry_count),
+            "retry_delay": float(retry_delay),
+            "image_request_delay": image_request_delay,
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "base_url": base_url,
+            "model_id": model_id,
+            "quality": quality,
+            "api_key": api_key,
+            "edit_input_fidelity": input_fidelity,
+        },
+    )
+
+    yield from generate_image_edits_concurrently(
+        prompt,
+        input_images,
+        save_dir,
+        image_count,
+        aspect_ratio,
+        resolution,
+        base_url,
+        model_id,
+        quality,
+        api_key,
+        input_fidelity,
+        concurrency,
+        retry_count,
+        retry_delay,
+        image_request_delay,
     )
 
 
@@ -1580,6 +1958,7 @@ def generate_random_image(
     concurrency,
     retry_count,
     retry_delay,
+    image_request_delay,
     aspect_ratio,
     resolution,
     base_url,
@@ -1602,6 +1981,7 @@ def generate_random_image(
         return
 
     retry_count, retry_delay = normalize_retry_settings(retry_count, retry_delay)
+    image_request_delay = normalize_image_request_delay(image_request_delay)
     quality = normalize_quality(quality)
     random_protocol = normalize_protocol(random_protocol)
     random_reasoning_effort = normalize_reasoning_effort(random_reasoning_effort)
@@ -1613,6 +1993,7 @@ def generate_random_image(
             "concurrency": int(concurrency),
             "retry_count": int(retry_count),
             "retry_delay": float(retry_delay),
+            "image_request_delay": image_request_delay,
             "aspect_ratio": aspect_ratio,
             "resolution": resolution,
             "base_url": base_url,
@@ -1668,6 +2049,7 @@ def generate_random_image(
         concurrency,
         retry_count,
         retry_delay,
+        image_request_delay,
         "random",
     ):
         yield random_prompt, gallery_items, status
@@ -1680,6 +2062,7 @@ def generate_creative_images(
     image_concurrency,
     retry_count,
     retry_delay,
+    image_request_delay,
     aspect_ratio,
     resolution,
     image_base_url,
@@ -1705,6 +2088,7 @@ def generate_creative_images(
     text_concurrency = max(1, int(text_concurrency))
     image_concurrency = max(1, int(image_concurrency))
     retry_count, retry_delay = normalize_retry_settings(retry_count, retry_delay)
+    image_request_delay = normalize_image_request_delay(image_request_delay)
     total_started_at = time.perf_counter()
     prompts = []
     saved_paths = []
@@ -1725,6 +2109,7 @@ def generate_creative_images(
             "image_concurrency": image_concurrency,
             "retry_count": retry_count,
             "retry_delay": retry_delay,
+            "image_request_delay": image_request_delay,
             "aspect_ratio": aspect_ratio,
             "resolution": resolution,
             "base_url": image_base_url,
@@ -1743,7 +2128,7 @@ def generate_creative_images(
     retry_events = []
     failed_prompts = []
     failed_images = []
-    yield "", [], f"正在生成 {creative_count} 段随机提示词并流水线出图；文本并发 {text_concurrency}，图片并发 {image_concurrency}；请求尺寸 {request_size}；品质 {quality}。"
+    yield "", [], f"正在生成 {creative_count} 段随机提示词并流水线出图；文本并发 {text_concurrency}，图片并发 {image_concurrency}；生图并发间隔 {image_request_delay:g} 秒；请求尺寸 {request_size}；品质 {quality}。"
 
     def prompt_worker(index):
         events = []
@@ -1763,6 +2148,10 @@ def generate_creative_images(
         return index, prompt, events
 
     def image_worker(index, prompt):
+        if image_request_delay > 0:
+            time.sleep((index - 1) * image_request_delay)
+            if should_stop("creative"):
+                raise RuntimeError("任务已停止。")
         started_at = time.perf_counter()
         events = []
         image_path = generate_one_image(
@@ -2109,12 +2498,14 @@ def save_settings(
     iteration_reasoning_effort,
     retry_count,
     retry_delay,
+    image_request_delay,
     random_system_prompt,
     random_user_prompt,
     iteration_optimizer_prompt,
     reverse_prompt,
 ):
     retry_count, retry_delay = normalize_retry_settings(retry_count, retry_delay)
+    image_request_delay = normalize_image_request_delay(image_request_delay)
     quality = normalize_quality(quality)
     random_protocol = normalize_protocol(random_protocol)
     iteration_protocol = normalize_protocol(iteration_protocol)
@@ -2140,6 +2531,7 @@ def save_settings(
             "iteration_reasoning_effort": iteration_reasoning_effort,
             "retry_count": retry_count,
             "retry_delay": retry_delay,
+            "image_request_delay": image_request_delay,
             "random_system_prompt": random_system_prompt,
             "random_user_prompt": random_user_prompt,
             "iteration_optimizer_prompt": iteration_optimizer_prompt,
@@ -2159,6 +2551,12 @@ def load_ui_state():
         latest_config["concurrency"],
         latest_config["aspect_ratio"],
         latest_config["resolution"],
+        latest_config["prompt"],
+        latest_config["image_count"],
+        latest_config["concurrency"],
+        latest_config["aspect_ratio"],
+        latest_config["resolution"],
+        latest_config["edit_input_fidelity"],
         latest_config["random_preference"],
         latest_config["prompt"],
         latest_config["image_count"],
@@ -2195,6 +2593,7 @@ def load_ui_state():
         latest_config["iteration_api_key"],
         latest_config["retry_count"],
         latest_config["retry_delay"],
+        latest_config["image_request_delay"],
         latest_config["random_system_prompt"],
         latest_config["random_user_prompt"],
         latest_config["iteration_optimizer_prompt"],
@@ -2393,7 +2792,7 @@ with gr.Blocks(title="GPT Image WebStudio", analytics_enabled=False) as app:
             """
             <section class="hero">
                 <h1>GPT Image WebStudio</h1>
-                <p>面向批量创作的本地工作台：手动提示词、随机抽卡、创意批量、自我迭代与统一接口设置集中管理。</p>
+                <p>一个为 GPT Image 系列接口打造的本地创作工作台：支持文生图、图生图、随机提示词、创意批量、自我迭代、提示词反推与统一接口管理。</p>
             </section>
             """
         )
@@ -2460,6 +2859,80 @@ with gr.Blocks(title="GPT Image WebStudio", analytics_enabled=False) as app:
                             elem_classes=["status-box"],
                         )
 
+            with gr.Tab("图生图"):
+                with gr.Row(equal_height=False):
+                    with gr.Column(scale=5, min_width=340):
+                        gr.HTML('<div class="section-title">图片编辑</div>')
+                        gr.HTML('<div class="mode-note">图生图：上传 1-4 张参考图，输入编辑提示词，再按设定数量生成新图片。大于 2.5MB 的输入图会先自动压缩；接口、保存目录、品质和重试参数请在“设置”页统一维护。多图时请用“第一张参考图 / 第二张参考图”，并补充图片特征，识别更稳定。</div>')
+                        edit_images_input = gr.File(
+                            label="参考图片",
+                            file_count="multiple",
+                            file_types=[".png", ".jpg", ".jpeg", ".webp"],
+                            type="filepath",
+                        )
+                        edit_prompt_input = gr.Textbox(
+                            label="编辑提示词",
+                            value=CONFIG["prompt"],
+                            placeholder="例如：保持人物与构图，将背景改成黄昏海边咖啡馆，柔和电影光，色彩更温暖",
+                            lines=7,
+                            max_lines=10,
+                        )
+
+                        with gr.Row():
+                            edit_image_count_input = gr.Slider(
+                                label="生成数量",
+                                minimum=1,
+                                maximum=12,
+                                value=CONFIG["image_count"],
+                                step=1,
+                            )
+                            edit_concurrency_input = gr.Slider(
+                                label="并发张数",
+                                minimum=1,
+                                maximum=6,
+                                value=CONFIG["concurrency"],
+                                step=1,
+                            )
+                            edit_aspect_ratio_input = gr.Dropdown(
+                                label="图片比例",
+                                choices=list(ASPECT_RATIOS.keys()),
+                                value=CONFIG["aspect_ratio"],
+                            )
+                            edit_resolution_input = gr.Dropdown(
+                                label="分辨率",
+                                choices=list(RESOLUTION_PRESETS.keys()),
+                                value=CONFIG["resolution"],
+                            )
+
+                        edit_input_fidelity_input = gr.Dropdown(
+                            label="输入保真度",
+                            choices=INPUT_FIDELITY_PRESETS,
+                            value=CONFIG["edit_input_fidelity"],
+                            info="high 更倾向保留参考图细节，low 更适合大幅重绘。",
+                        )
+
+                        with gr.Row():
+                            edit_generate_btn = gr.Button("开始图生图", variant="primary", size="lg")
+                            edit_stop_btn = gr.Button("停止", variant="stop", size="lg")
+
+                    with gr.Column(scale=6, min_width=360):
+                        gr.HTML('<div class="section-title">编辑结果</div>')
+                        edit_gallery_output = gr.Gallery(
+                            label="图片画廊",
+                            columns=2,
+                            rows=1,
+                            height="auto",
+                            object_fit="contain",
+                            show_label=False,
+                            allow_preview=True,
+                            elem_classes=["gallery-panel"],
+                        )
+                        edit_status_output = gr.Textbox(
+                            label="状态",
+                            lines=4,
+                            elem_classes=["status-box"],
+                        )
+
             with gr.Tab("随机模式"):
                 with gr.Row(equal_height=False):
                     with gr.Column(scale=5, min_width=340):
@@ -2468,7 +2941,7 @@ with gr.Blocks(title="GPT Image WebStudio", analytics_enabled=False) as app:
                         random_preference_input = gr.Textbox(
                             label="本次创作方向",
                             value=CONFIG["random_preference"],
-                            placeholder="例如：雨后街角、玻璃花房、黄昏海岸",
+                            placeholder="例如：白色丝袜",
                             lines=1,
                         )
                         random_prompt_output = gr.Textbox(
@@ -2535,7 +3008,7 @@ with gr.Blocks(title="GPT Image WebStudio", analytics_enabled=False) as app:
                         creative_preference_input = gr.Textbox(
                             label="本次创作方向",
                             value=CONFIG["random_preference"],
-                            placeholder="例如：雨后街角、玻璃花房、黄昏海岸",
+                            placeholder="例如：白色丝袜、便利店夜班、雨后窗边",
                             lines=1,
                         )
                         creative_prompts_output = gr.Textbox(
@@ -2614,7 +3087,7 @@ with gr.Blocks(title="GPT Image WebStudio", analytics_enabled=False) as app:
                         iterative_preference_input = gr.Textbox(
                             label="创作主题" if CONFIG["iteration_prompt_source"] == "自定义提示词" else "初始创作方向",
                             value=CONFIG["random_preference"],
-                            placeholder="例如：雨后街角、玻璃花房、黄昏海岸" if CONFIG["iteration_prompt_source"] == "自定义提示词" else "例如：雨后街角、玻璃花房、黄昏海岸",
+                            placeholder="例如：课堂午睡、雨夜车站、便利店夜班" if CONFIG["iteration_prompt_source"] == "自定义提示词" else "例如：白色丝袜、雨夜车站、图书馆",
                             lines=1,
                         )
                         iterative_custom_prompt_input = gr.Textbox(
@@ -2688,7 +3161,7 @@ with gr.Blocks(title="GPT Image WebStudio", analytics_enabled=False) as app:
                         )
                         reverse_local_path_input = gr.Textbox(
                             label="本地图片路径",
-                            placeholder=r"例如：D:\Images\sample.png",
+                            placeholder=r"例如：D:\Users\isund\Desktop\图片生成\AI_Cards\img_xxx.png",
                             lines=1,
                         )
                         reverse_generate_btn = gr.Button("开始反推提示词", variant="primary", size="lg")
@@ -2791,6 +3264,14 @@ with gr.Blocks(title="GPT Image WebStudio", analytics_enabled=False) as app:
                                     value=CONFIG["retry_delay"],
                                     step=1,
                                 )
+                                settings_image_request_delay_input = gr.Slider(
+                                    label="生图并发间隔秒",
+                                    minimum=0,
+                                    maximum=30,
+                                    value=CONFIG["image_request_delay"],
+                                    step=1,
+                                    info="只影响文生图和图生图的并发启动节奏，用于避开中转站限流；不等同于失败后的重试间隔。",
+                                )
 
                     with gr.Column(scale=1, min_width=420):
                         settings_random_system_prompt_input = gr.Textbox(
@@ -2832,6 +3313,7 @@ with gr.Blocks(title="GPT Image WebStudio", analytics_enabled=False) as app:
             concurrency_input,
             settings_retry_count_input,
             settings_retry_delay_input,
+            settings_image_request_delay_input,
             aspect_ratio_input,
             resolution_input,
             settings_base_url_input,
@@ -2848,6 +3330,34 @@ with gr.Blocks(title="GPT Image WebStudio", analytics_enabled=False) as app:
         queue=False,
     )
 
+    edit_event = edit_generate_btn.click(
+        fn=generate_image_edit,
+        inputs=[
+            edit_images_input,
+            edit_prompt_input,
+            settings_save_dir_input,
+            edit_image_count_input,
+            edit_concurrency_input,
+            settings_retry_count_input,
+            settings_retry_delay_input,
+            settings_image_request_delay_input,
+            edit_aspect_ratio_input,
+            edit_resolution_input,
+            settings_base_url_input,
+            settings_model_id_input,
+            settings_quality_input,
+            settings_api_key_input,
+            edit_input_fidelity_input,
+        ],
+        outputs=[edit_gallery_output, edit_status_output],
+    )
+    edit_stop_btn.click(
+        fn=lambda: request_stop("edit"),
+        outputs=[edit_status_output],
+        cancels=[edit_event],
+        queue=False,
+    )
+
     random_event = random_generate_btn.click(
         fn=generate_random_image,
         inputs=[
@@ -2856,6 +3366,7 @@ with gr.Blocks(title="GPT Image WebStudio", analytics_enabled=False) as app:
             random_concurrency_input,
             settings_retry_count_input,
             settings_retry_delay_input,
+            settings_image_request_delay_input,
             random_aspect_ratio_input,
             random_resolution_input,
             settings_base_url_input,
@@ -2887,6 +3398,7 @@ with gr.Blocks(title="GPT Image WebStudio", analytics_enabled=False) as app:
             creative_image_concurrency_input,
             settings_retry_count_input,
             settings_retry_delay_input,
+            settings_image_request_delay_input,
             creative_aspect_ratio_input,
             creative_resolution_input,
             settings_base_url_input,
@@ -2974,6 +3486,12 @@ with gr.Blocks(title="GPT Image WebStudio", analytics_enabled=False) as app:
         concurrency_input,
         aspect_ratio_input,
         resolution_input,
+        edit_prompt_input,
+        edit_image_count_input,
+        edit_concurrency_input,
+        edit_aspect_ratio_input,
+        edit_resolution_input,
+        edit_input_fidelity_input,
         random_preference_input,
         random_prompt_output,
         random_image_count_input,
@@ -3010,6 +3528,7 @@ with gr.Blocks(title="GPT Image WebStudio", analytics_enabled=False) as app:
         settings_iteration_api_key_input,
         settings_retry_count_input,
         settings_retry_delay_input,
+        settings_image_request_delay_input,
         settings_random_system_prompt_input,
         settings_random_user_prompt_input,
         settings_iteration_optimizer_prompt_input,
@@ -3037,6 +3556,7 @@ with gr.Blocks(title="GPT Image WebStudio", analytics_enabled=False) as app:
             settings_iteration_reasoning_effort_input,
             settings_retry_count_input,
             settings_retry_delay_input,
+            settings_image_request_delay_input,
             settings_random_system_prompt_input,
             settings_random_user_prompt_input,
             settings_iteration_optimizer_prompt_input,
