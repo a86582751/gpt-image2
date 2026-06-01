@@ -8,12 +8,14 @@
   "creative_count": 5,
   "retry_count": 1,
   "retry_delay": 2,
+  "image_request_delay": 0,
   "aspect_ratio": "4:3 横图",
   "resolution": "高清",
   "base_url": "",
   "model_id": "",
   "quality": "auto",
   "api_key": "",
+  "edit_input_fidelity": "high",
   "random_base_url": "",
   "random_model_id": "",
   "random_api_key": "",
@@ -27,5 +29,9 @@
   "iteration_model_id": "",
   "iteration_api_key": "",
   "iteration_protocol": "自动识别",
-  "iteration_reasoning_effort": "关闭"
+  "iteration_reasoning_effort": "关闭",
+  "random_system_prompt": "",
+  "random_user_prompt": "",
+  "iteration_optimizer_prompt": "",
+  "reverse_prompt": ""
 }
